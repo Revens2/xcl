@@ -1562,6 +1562,7 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
     } else {
         f(this)
     };
+    let mut memory = None;
     if n == 0 {
         if let Some(s) = UNMAPPABLE.lock().unwrap().as_mut() {
             s.remove(&(this as usize));
@@ -1575,22 +1576,36 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
         if let Some(m) = TITLE_ADDRESS.lock().unwrap().as_mut() {
             m.remove(&(this as usize));
         }
-        super::sparse::forget_buffer(this as usize);
+        // a held resource's tiles stay pinned until it goes (`late_release`)
+        if !held {
+            super::sparse::forget_buffer(this as usize);
+        }
         super::vram::forget(this as usize);
         super::title_textures::forget(this as usize);
         let gone = UMA_BUFFERS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
-        if let (Some((p, _, true)), Some(u)) = (gone, crate::gpu::uma::get()) {
-            if u.is_sparse(p) {
-                super::sparse::free(p);
-            } else {
-                u.free(p);
-            }
-        }
+        // the block XCL placed under it (not the title's own memory)
+        memory = match gone {
+            Some((p, _, true)) => Some(p),
+            _ => None,
+        };
     }
     if held {
-        super::late_release::hold(this as usize);
+        // its memory goes with it: a queue may still be using it
+        super::late_release::hold(this as usize, memory);
+    } else if let Some(p) = memory {
+        free_backing(p);
     }
     n
+}
+
+/// Give back the unified-memory or sparse-VRAM block XCL placed under a resource that is gone.
+pub(super) unsafe fn free_backing(p: usize) {
+    let Some(u) = crate::gpu::uma::get() else { return };
+    if u.is_sparse(p) {
+        super::sparse::free(p);
+    } else {
+        u.free(p);
+    }
 }
 
 /// A stand-in pipeline released for good takes its background-built real pipeline with it.
@@ -5144,6 +5159,7 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
             f(this, a1)
         }
         23 => q_signal_x(this, a1 as *mut c_void, a2 as u64, a3 as u32) as u32 as usize,
+        29 => q_copy_page_mappings(a1 as u32, a2, a3, a4 as u32) as u32 as usize,
         30 => super::present::present_x(this, a1 as u32, a2 as *const u8, a3 as *const u8) as u32 as usize,
         // the newer layout's #35: ExecuteCommandListsX(count, lists, a value, flags) – a retail
         // game submits all its command lists this way (flags 3; 0 for the one it recorded at
@@ -5189,6 +5205,34 @@ macro_rules! queue_slots {
     };
 }
 queue_slots!(14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35);
+
+/// command queue #29 (#31 in the newer layout) `CopyPageMappingsBatchX(count, batches, pool,
+/// pool pages, flags)`: the title maps pages of its memory into GPU views – a retail game the
+/// pages its texture streaming fills (a 6 GB pool) into the GPU views its textures are in,
+/// tens of thousands of them while its world loads. Recorded per page (`kernelx::mirrors`);
+/// as a stub every mapping was dropped (#1031).
+unsafe fn q_copy_page_mappings(count: u32, batches: usize, pool: usize, pool_pages: u32) -> HRESULT {
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static MAPPED: AtomicU64 = AtomicU64::new(0);
+    static UNMAPPED: AtomicU64 = AtomicU64::new(0);
+    static ELSEWHERE: AtomicU64 = AtomicU64::new(0);
+    static PHYSICAL: AtomicU64 = AtomicU64::new(0);
+    let n = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    match crate::hle::kernelx::mirrors::apply_batches(count, batches, pool, pool_pages) {
+        Some(d) => {
+            let add = |total: &AtomicU64, k: u64| total.fetch_add(k, Ordering::Relaxed) + k;
+            let (m, p, u, e) = (add(&MAPPED, d.mapped), add(&PHYSICAL, d.physical), add(&UNMAPPED, d.unmapped), add(&ELSEWHERE, d.elsewhere));
+            if n == 1 || n.is_power_of_two() {
+                crate::xlog_info!("D3D12.X: queue CopyPageMappingsBatchX: {n} calls; GPU-view pages so far: {m} mapped ({p} to a physical page the title mapped there), {u} unmapped; {e} pages elsewhere ignored (pool {pool:#x}, {pool_pages} pages of 64 KiB)");
+            }
+        }
+        None => {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| crate::xlog_warn!("D3D12.X: queue CopyPageMappingsBatchX({count}, {batches:#x}, {pool:#x}, {pool_pages}): a batch or range is unreadable or leaves the pool – the call is ignored"));
+        }
+    }
+    S_OK
+}
 
 /// command queue #23 SignalX(fence, value, flush flags): Signal with the console's cache flush
 /// options – the PC's Signal makes the queue's writes visible itself. (A stub that signalled
@@ -6037,6 +6081,66 @@ mod console_format_query_tests {
             assert!(hr >= 0 && !p.is_null(), "D16S8 target with a 118 clear value: {hr:#x}");
             let r = ID3D12Resource::from_raw(p);
             assert_eq!(r.GetDesc().Format.0, 44, "made R24G8_TYPELESS");
+        }
+    }
+}
+
+#[cfg(test)]
+mod held_release_tests {
+    use super::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+
+    /// A resource whose last `Release` is held (a queue still has work) keeps the unified memory
+    /// XCL placed under it until the hold ends: given back at the title's `Release`, the block
+    /// could go to the next allocation while the GPU still used it.
+    #[test]
+    fn a_held_resource_keeps_its_unified_memory_until_it_goes() {
+        unsafe {
+            if !super::super::late_release::enabled() {
+                return;
+            }
+            let Ok(dev) = crate::gpu::agility::create_device(None, D3D_FEATURE_LEVEL_11_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            let Some(u) = crate::gpu::uma::get() else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            // a queue with work in flight (it waits for a fence nobody has signalled yet) that
+            // the title has submitted to: late release waits for the queues it knows
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+            let gate: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            queue.Wait(&gate, 1).unwrap();
+            super::super::present::note_execute(queue.as_raw(), &[]);
+
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 4096,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let mut res: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut res).unwrap();
+            let raw = res.unwrap().into_raw();
+            adopt(raw, Kind::Resource);
+            // the block XCL placed under it, recorded as `place_console_buffer` does
+            let p = u.alloc(0x1_0000, crate::gpu::uma::GRAIN).expect("unified memory") as usize;
+            UMA_BUFFERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(raw as usize, (p, 0x1_0000, true));
+
+            // the title's last Release, while the queue still has work
+            let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(raw as *const *const usize)).add(2));
+            assert_eq!(release(raw), 0);
+            assert!(u.is_allocated(p), "the block under a held resource went back while a queue still had work");
+
+            gate.Signal(1).unwrap();
+            let start = std::time::Instant::now();
+            while u.is_allocated(p) && start.elapsed() < std::time::Duration::from_secs(10) {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(!u.is_allocated(p), "the block goes back once the held resource goes");
         }
     }
 }
